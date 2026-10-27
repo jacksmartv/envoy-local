@@ -1,0 +1,220 @@
+# Envoy front proxy — native static configuration.
+#
+# Image: envoy/Dockerfile (envoyproxy/envoy:v1.40.2 by default; see .env.example).
+# Mounted read-only at /etc/envoy. Validate after every edit:   ./scripts/validate.sh
+#
+# Layout of this file:
+#   1. admin            — diagnostics endpoint, Unix socket only (no network port)
+#   2. listeners        — one plaintext HTTP listener (:10000 in the container)
+#        └ HttpConnectionManager: header policy, timeouts, access log
+#            └ route_config: one virtual host per hostname, routes per path
+#   3. clusters         — one cluster per backend service (Docker DNS name + port)
+#
+# Envoy's static bootstrap has no "include" mechanism, so everything lives in
+# this one file. To add an app, copy a virtual host block and a cluster block;
+# see docs/routing.md.
+
+admin:
+  # A Unix socket, not a TCP port: no network access at all. Only containers that
+  # mount the shared "envoy-admin" volume (Envoy itself, routes-ui, and the opt-in
+  # compose.admin.yaml forwarder) can reach it. Query it with ./scripts/admin.sh.
+  address:
+    pipe: { path: /run/envoy-admin/admin.sock, mode: 0660 }
+
+# Cap concurrent downstream connections (Envoy warns at startup without one).
+overload_manager:
+  resource_monitors:
+    - name: envoy.resource_monitors.global_downstream_max_connections
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.resource_monitors.downstream_connections.v3.DownstreamConnectionsConfig
+        max_active_downstream_connections: 10000
+
+static_resources:
+  listeners:
+    - name: http
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 10000 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                codec_type: AUTO
+
+                # --- Client IP / forwarding headers (docs/routing.md#request-headers) ---
+                # Envoy is the edge: the trusted client address is the TCP peer.
+                # Client-supplied X-Forwarded-For is kept but never trusted; Envoy
+                # appends the peer address and sets X-Envoy-External-Address to it.
+                use_remote_address: true
+                xff_num_trusted_hops: 0
+                # Only the container's own loopback counts as "internal". Every
+                # real client (including the Docker gateway and other containers)
+                # is external, so client-sent x-envoy-* headers are stripped and
+                # x-envoy-internal is never set. An empty cidr_ranges list would
+                # NOT do this: Envoy then falls back to treating all RFC1918
+                # addresses (e.g. 172.x Docker networks) as internal.
+                internal_address_config:
+                  cidr_ranges:
+                    - { address_prefix: 127.0.0.1, prefix_len: 32 }
+
+                # Match virtual hosts on the hostname only ("host:8080" -> "host"),
+                # as Gateway API hostname matching does.
+                strip_any_host_port: true
+                # Return x-request-id to the client so a failure can be found in
+                # the access log.
+                always_set_request_id_in_response: true
+
+                # --- Downstream timeouts ---
+                request_headers_timeout: 10s   # slow/incomplete request headers -> 408
+                stream_idle_timeout: 300s      # no bytes on a stream (Envoy default, explicit)
+
+                # WebSocket upgrades are allowed on every route (Envoy Gateway
+                # enables them by default too).
+                upgrade_configs:
+                  - upgrade_type: websocket
+
+                access_log:
+                  - name: envoy.access_loggers.stdout
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+                      log_format:
+                        text_format_source:
+                          # ">" folds the lines into one and keeps the trailing
+                          # newline, which Envoy does not add by itself.
+                          # The logged path is the path sent upstream (after any
+                          # rewrite). The original path isn't available because
+                          # suppress_envoy_headers also drops x-envoy-original-path;
+                          # route= shows which (rewriting) route matched.
+                          inline_string: >
+                            [%START_TIME%] "%REQ(:METHOD)% %REQ(:PATH)% %PROTOCOL%"
+                            status=%RESPONSE_CODE% flags=%RESPONSE_FLAGS% details=%RESPONSE_CODE_DETAILS%
+                            host=%REQ(:AUTHORITY)% route=%ROUTE_NAME% cluster=%UPSTREAM_CLUSTER%
+                            upstream=%UPSTREAM_HOST%
+                            duration_ms=%DURATION% upstream_ms=%RESPONSE_DURATION%
+                            bytes_in=%BYTES_RECEIVED% bytes_out=%BYTES_SENT%
+                            client=%DOWNSTREAM_REMOTE_ADDRESS_WITHOUT_PORT% xff="%REQ(X-FORWARDED-FOR)%"
+                            request_id=%REQ(X-REQUEST-ID)% upstream_failure="%UPSTREAM_TRANSPORT_FAILURE_REASON%"
+                            ua="%REQ(USER-AGENT)%"
+
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                      # Don't add x-envoy-upstream-service-time, x-envoy-expected-rq-timeout-ms,
+                      # etc. Envoy Gateway also omits them unless enableEnvoyHeaders is set.
+                      suppress_envoy_headers: true
+
+                route_config:
+                  name: local_routes
+                  # A request whose Host matches no virtual host below gets
+                  # Envoy's native 404 (response flag NR, details route_not_found).
+                  virtual_hosts:
+
+                    # ---------------------------------------------------------
+                    - name: app-one
+                      domains: ["app-one.local.test"]
+                      routes:
+                        # Path-prefix routing to a *different* backend, no rewrite:
+                        # /status/<code> is served by app-two (httpbin).
+                        # path_separated_prefix matches /status and /status/...
+                        # but not /statuses, like Gateway API PathPrefix.
+                        - name: app-one-status-prefix
+                          match: { path_separated_prefix: /status }
+                          route: { cluster: app_two, timeout: 15s }
+
+                        # WebSocket endpoint: no total request timeout (a socket
+                        # can live for hours), but close it after 5 minutes idle.
+                        - name: app-one-websocket
+                          match: { path_separated_prefix: /ws }
+                          route: { cluster: app_one, timeout: 0s, idle_timeout: 300s }
+
+                        # Catch-all for the host.
+                        - name: app-one-default
+                          match: { prefix: / }
+                          route: { cluster: app_one, timeout: 15s }
+
+                    # ---------------------------------------------------------
+                    - name: app-two
+                      domains: ["app-two.local.test"]
+                      routes:
+                        # Prefix rewrite (Gateway API URLRewrite ReplacePrefixMatch):
+                        #   /api -> /anything    /api/items?x=1 -> /anything/items?x=1
+                        # httpbin's /anything echoes the request, showing the rewrite.
+                        # To replace a prefix with "/" itself, see docs/routing.md#rewriting.
+                        - name: app-two-api-rewrite
+                          match: { path_separated_prefix: /api }
+                          route: { cluster: app_two, timeout: 15s, prefix_rewrite: /anything }
+
+                        # Per-route timeout: httpbin /delay/<n> answers after n seconds,
+                        # so /delay/1 succeeds and /delay/5 gets a 504 (flag UT) after 3s.
+                        - name: app-two-delay
+                          match: { path_separated_prefix: /delay }
+                          route: { cluster: app_two, timeout: 3s }
+
+                        - name: app-two-root
+                          match: { path: / }
+                          route: { cluster: app_two, timeout: 15s }
+
+                        # No catch-all: any other path on this host returns a 404
+                        # (flag NR). This demonstrates unknown-path handling.
+
+                    # ---------------------------------------------------------
+                    # Virtual hosts for your apps: add them by hand above this
+                    # marker, or with ./scripts/add-route.sh, which inserts them
+                    # right before it.
+                    # --- add-route: hugo.local.test ---
+                    - name: hugo.local.test
+                      domains: ["hugo.local.test"]
+                      routes:
+                        - { name: "hugo.local.test /", match: { prefix: / }, route: { cluster: hugo_local_test__host_docker_internal_5678, timeout: 15s } }
+                    # --- end add-route: hugo.local.test ---
+
+                    # @add-route:virtual-hosts (keep this line)
+
+  clusters:
+    # Each cluster resolves a Docker DNS name. STRICT_DNS re-resolves it every
+    # 5s (Envoy's default), so a restarted container's new IP is picked up. If a name
+    # doesn't resolve, Envoy still starts and only that cluster returns 503.
+    - name: app_one
+      type: STRICT_DNS
+      dns_lookup_family: V4_ONLY
+      connect_timeout: 5s
+      load_assignment:
+        cluster_name: app_one
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: sample-app-one, port_value: 8000 }
+
+    - name: app_two
+      type: STRICT_DNS
+      dns_lookup_family: V4_ONLY
+      connect_timeout: 5s
+      load_assignment:
+        cluster_name: app_two
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: sample-app-two, port_value: 8080 }
+
+    # Clusters for your apps. Targets:
+    #   service on your machine / published container port -> host.docker.internal:<port>
+    #   container on a network Envoy joined                   -> <container-name>:<container-port>
+    # --- add-route: hugo.local.test ---
+    - name: hugo_local_test__host_docker_internal_5678
+      type: STRICT_DNS
+      dns_lookup_family: V4_ONLY
+      connect_timeout: 5s
+      load_assignment:
+        cluster_name: hugo_local_test__host_docker_internal_5678
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: host.docker.internal, port_value: 5678 }
+    # --- end add-route: hugo.local.test ---
+
+    # @add-route:clusters (keep this line)

@@ -1,0 +1,37 @@
+# OPT-IN: open the Envoy admin interface in a browser at http://127.0.0.1:9901/
+#
+#   docker compose -f compose.yaml -f compose.admin.yaml up -d --wait
+#   ... use it ...
+#   docker compose up -d --wait --remove-orphans     # close it again
+#
+# Envoy's admin listens only on a Unix socket in the shared "envoy-admin"
+# volume. This override adds a tiny socat forwarder that connects to that socket
+# and publishes it on host loopback. It does not share Envoy's network, so it
+# keeps working when Envoy restarts (including crashes and /quitquitquit).
+#
+# WARNING: the admin API has no authentication and can change Envoy's state
+# (e.g. POST /quitquitquit restarts it, /logging changes log levels). While
+# this override is active, any process on this machine and any container on the
+# envoy-local network can call it. Don't leave it on.
+#
+# smoke-test.sh starts the stack without this file, which closes admin access
+# again and removes the forwarder. If you add this file to COMPOSE_FILE in .env,
+# the smoke test's "admin is not exposed" checks fail, as they should.
+
+services:
+  envoy-admin-forward:
+    image: alpine/socat:1.8.1.1
+    command: ["TCP-LISTEN:9901,fork,reuseaddr", "UNIX-CONNECT:/run/envoy-admin/admin.sock"]
+    volumes:
+      - envoy-admin:/run/envoy-admin:ro
+    ports:
+      - "127.0.0.1:${ENVOY_ADMIN_PORT:-9901}:9901"
+    networks: [envoy-local]
+    depends_on:
+      envoy:
+        condition: service_healthy
+    user: "101:101"          # the socket is owned by Envoy's uid/gid 101, mode 0660
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped

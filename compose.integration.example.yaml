@@ -1,0 +1,26 @@
+# Attach Envoy to an existing application's Docker network, without touching
+# that application's Compose file, Dockerfile or images.
+#
+# 1. Copy this file:   cp compose.integration.example.yaml compose.integration.yaml
+#    (compose.integration.yaml is gitignored, so each developer can point it
+#    at their own app network.)
+# 2. Set APP_NETWORK in .env to the network name from `docker network ls`.
+# 3. Add a virtual host + cluster for the app to envoy/envoy.yaml.
+# 4. Start with both files:
+#      docker compose -f compose.yaml -f compose.integration.yaml up -d --wait
+#    or set COMPOSE_FILE=compose.yaml:compose.integration.yaml in .env so that
+#    plain `docker compose ...` commands include it.
+#
+# Envoy stays on its own `envoy-local` network as well, so the sample backends
+# keep working. Removing this file (or omitting -f) and re-running `up -d`
+# detaches Envoy from the app network; the app itself is not restarted.
+# See docs/architecture.md#integrating-with-an-existing-docker-network.
+
+services:
+  envoy:
+    networks: [app]   # merged with `envoy-local` from compose.yaml
+
+networks:
+  app:
+    external: true    # created and owned by the application's Compose project
+    name: ${APP_NETWORK:?Set APP_NETWORK to the existing Docker network name}

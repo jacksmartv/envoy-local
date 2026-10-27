@@ -1,0 +1,96 @@
+name: envoy-local
+
+# Standalone stack: Envoy front proxy + two sample backends on one private network.
+# Start:  docker compose up -d --build --wait
+# Stop:   docker compose down
+# Every variable below is optional; see .env.example.
+
+x-hardening: &hardening
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  restart: unless-stopped
+
+services:
+  envoy:
+    <<: *hardening
+    build:
+      context: ./envoy
+      args:
+        ENVOY_VERSION: ${ENVOY_VERSION:-v1.40.2}
+    image: envoy-local/envoy:${ENVOY_VERSION:-v1.40.2}
+    environment:
+      ENVOY_LOG_LEVEL: ${ENVOY_LOG_LEVEL:-info}
+      ENVOY_DUMP_CONFIG: ${ENVOY_DUMP_CONFIG:-false}
+    volumes:
+      - ./envoy:/etc/envoy:ro
+      - envoy-admin:/run/envoy-admin      # admin Unix socket (see envoy.yaml)
+    extra_hosts:
+      # Lets clusters target services running on the developer's machine
+      # (or container ports published to it) as host.docker.internal:<port>.
+      # Needed on Linux, and on Docker Desktop for user-defined networks.
+      - "host.docker.internal:host-gateway"
+    ports:
+      # Only the HTTP listener is published. By default it binds to host
+      # loopback; set ENVOY_BIND_ADDRESS=0.0.0.0 to accept LAN traffic.
+      # The admin interface is a Unix socket and is never published.
+      - "${ENVOY_BIND_ADDRESS:-127.0.0.1}:${ENVOY_HTTP_PORT:-8080}:10000"
+    healthcheck:
+      # Admin /ready returns 200 once Envoy is LIVE.
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "--unix-socket", "/run/envoy-admin/admin.sock", "http://localhost/ready"]
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+    networks: [envoy-local]
+
+  sample-app-one:
+    <<: *hardening
+    build: ./examples/app-one
+    image: envoy-local/app-one:dev
+    networks: [envoy-local]
+    # No `ports:`: reachable only through Envoy.
+
+  sample-app-two:
+    <<: *hardening
+    build: ./examples/app-two
+    image: envoy-local/app-two:dev
+    networks: [envoy-local]
+
+  # Web UI to list, add and remove routes: http://127.0.0.1:8090/
+  # It runs scripts/add-route.sh (validate with the same Envoy binary, restart
+  # Envoy through the admin socket). No Docker socket; it can write only ./envoy.
+  routes-ui:
+    <<: *hardening
+    build:
+      context: ./routes-ui
+      args:
+        ENVOY_VERSION: ${ENVOY_VERSION:-v1.40.2}
+    image: envoy-local/routes-ui:${ENVOY_VERSION:-v1.40.2}
+    # Must be able to write ./envoy on the host. Docker Desktop allows any uid;
+    # on Linux set ROUTES_UI_UID/GID to your `id -u`/`id -g` in .env.
+    user: "${ROUTES_UI_UID:-101}:${ROUTES_UI_GID:-101}"
+    group_add: ["101"]          # access to the admin socket (group 101, mode 0660)
+    environment:
+      ENVOY_HTTP_PORT: ${ENVOY_HTTP_PORT:-8080}
+      ROUTES_UI_PORT: ${ROUTES_UI_PORT:-8090}
+    volumes:
+      - ./envoy:/workspace/envoy                 # read-write: routes live in envoy.yaml
+      - ./scripts:/workspace/scripts:ro
+      - envoy-admin:/run/envoy-admin:ro
+    tmpfs: [/tmp]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"     # to check host:PORT targets like Envoy does
+    ports:
+      - "127.0.0.1:${ROUTES_UI_PORT:-8090}:8090"
+    depends_on:
+      envoy:
+        condition: service_healthy
+    networks: [envoy-local]
+
+networks:
+  envoy-local:
+    name: envoy-local
+
+volumes:
+  envoy-admin:   # holds only the admin Unix socket
